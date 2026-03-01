@@ -37,6 +37,29 @@ func (e *AmazonExtractor) getProductTextDetail(doc *goquery.Document) ProductDet
 		byDesc = e.getInnerText(doc, ".a-expander-content.a-expander-partial-collapse-content")
 	}
 
+	// 提取特征列表 (About this item)
+	var aboutThisItem []string
+	selectors := []string{
+		"#feature-bullets li span.a-list-item",
+		"#productFactsDesktopExpander li span.a-list-item",
+		"div#featurebullets_feature_div li span.a-list-item",
+		".a-unordered-list.a-vertical.a-spacing-mini li span.a-list-item",
+	}
+
+	for _, sel := range selectors {
+		doc.Find(sel).Each(func(i int, s *goquery.Selection) {
+			text := strings.TrimSpace(strings.ReplaceAll(s.Text(), "\t", " "))
+			// 去除一些空行或者只有格式的行
+			if text != "" {
+				aboutThisItem = append(aboutThisItem, text)
+			}
+		})
+		// 如果找到了内容，就不再用后面的选择器了，防止重复提取
+		if len(aboutThisItem) > 0 {
+			break
+		}
+	}
+
 	featureBullets := e.getInnerText(doc, "#feature-bullets")
 	bucketdividerDesc := e.getInnerText(doc, ".aplus-v2.desktop.celwidget")
 	spacingTopBase := e.getInnerText(doc, ".a-row.a-spacing-top-base")
@@ -74,6 +97,20 @@ func (e *AmazonExtractor) getProductTextDetail(doc *goquery.Document) ProductDet
 		discount = &discountStr
 	}
 
+	// 提取ProductID (ASIN)
+	var productID string
+	asinPattern := regexp.MustCompile(`"asin"\s*:\s*"([A-Z0-9]{10})"`)
+	if asins := asinPattern.FindStringSubmatch(string(doc.Text())); len(asins) > 1 {
+		productID = asins[1]
+	} else {
+		asinPattern2 := regexp.MustCompile(`id="ASIN" name="ASIN" value="([A-Z0-9]{10})"`)
+		if ahtml, err := doc.Html(); err == nil {
+			if asins2 := asinPattern2.FindStringSubmatch(ahtml); len(asins2) > 1 {
+				productID = asins2[1]
+			}
+		}
+	}
+
 	return ProductDetail{
 		Title:             productTitle,
 		ByDesc:            byDesc,
@@ -84,12 +121,17 @@ func (e *AmazonExtractor) getProductTextDetail(doc *goquery.Document) ProductDet
 		ProductDiscount:   discount,
 		ProductPrice:      price,
 		Language:          language,
+		AboutThisItem:     aboutThisItem,
+		ProductID:         productID,
 	}
 }
 
-// getImgSrc 获取产品图片URL列表 (私有方法)
-func (e *AmazonExtractor) getImgSrc(content string) []string {
-	// 图片JSON解析
+// getImgSrc 获取产品图片URL列表和详情多尺寸对象集合 (私有方法)
+func (e *AmazonExtractor) getImgSrc(content string) ([]string, []AmazonImage) {
+	var images []string
+	var imageDetails []AmazonImage
+
+	// 1. 直寻 ImageBlockATF 解析
 	patternImgObj := regexp.MustCompile(`P\.when\('A'\)\.register\("ImageBlockATF", function\(A\)\{\s*var data = \{\s*'enableS2WithoutS1': [True|true|False|false]+\,\s*'notShowVideoCount': [True|true|False|false]+\,\s*'colorImages': \{ 'initial': (.*?)\}\,\s*'colorToAsin'`)
 	matches := patternImgObj.FindStringSubmatch(content)
 
@@ -98,24 +140,75 @@ func (e *AmazonExtractor) getImgSrc(content string) []string {
 		var totalImageJSON []map[string]interface{}
 
 		if err := json.Unmarshal([]byte(totalImageJSONStr), &totalImageJSON); err == nil {
-			var images []string
 			for _, row := range totalImageJSON {
+				// 获取基础原图
+				var original string
 				if hiResImg, ok := row["hiRes"].(string); ok && hiResImg != "" {
+					original = hiResImg
 					images = append(images, hiResImg)
 				} else if largeImg, ok := row["large"].(string); ok && largeImg != "" {
+					original = largeImg
 					images = append(images, largeImg)
 				}
+
+				if original != "" {
+					// Amazon 图片自带尺寸调节后缀，比如 _AC_UY218_
+					// 从 original URL "https://m.media-amazon.com/images/I/xxxx.jpg"
+					// 转换成 "https://m.media-amazon.com/images/I/xxxx._AC_UY218_.jpg"
+					parts := strings.Split(original, ".")
+					if len(parts) >= 4 { // https://.../xx.jpg
+						baseName := strings.Join(parts[:len(parts)-1], ".")
+						ext := parts[len(parts)-1]
+
+						imageDetails = append(imageDetails, AmazonImage{
+							Original: original,
+							Small:    fmt.Sprintf("%s._AC_UY218_.%s", baseName, ext),
+							Medium:   fmt.Sprintf("%s._AC_UY327_.%s", baseName, ext),
+							Large:    fmt.Sprintf("%s._AC_UY436_.%s", baseName, ext),
+						})
+					}
+				}
 			}
-			return images
+			return images, imageDetails
 		}
 	}
 
-	// 备用图片提取方法
-	imgPattern := regexp.MustCompile(`register.*?var data = (.*?)colorToAsin`)
+	// 2. 备选提取 (如果有更简单的 colorImages json 节点)
+	imgPattern := regexp.MustCompile(`colorImages.*?initial': (.*?)},\s*'colorToAsin`)
 	if cleanContentMatch := imgPattern.FindStringSubmatch(content); len(cleanContentMatch) > 1 {
-		content = cleanContentMatch[1]
+		// Attempt to parse fallback json
+		var totalImageJSON []map[string]interface{}
+		cleanStr := strings.ReplaceAll(cleanContentMatch[1], "\\", "")
+		if err := json.Unmarshal([]byte(cleanStr), &totalImageJSON); err == nil {
+			for _, row := range totalImageJSON {
+				var original string
+				if hiResImg, ok := row["hiRes"].(string); ok && hiResImg != "" {
+					original = hiResImg
+					images = append(images, hiResImg)
+				} else if largeImg, ok := row["large"].(string); ok && largeImg != "" {
+					original = largeImg
+					images = append(images, largeImg)
+				}
+
+				if original != "" {
+					parts := strings.Split(original, ".")
+					if len(parts) >= 4 {
+						baseName := strings.Join(parts[:len(parts)-1], ".")
+						ext := parts[len(parts)-1]
+						imageDetails = append(imageDetails, AmazonImage{
+							Original: original,
+							Small:    fmt.Sprintf("%s._AC_UY218_.%s", baseName, ext),
+							Medium:   fmt.Sprintf("%s._AC_UY327_.%s", baseName, ext),
+							Large:    fmt.Sprintf("%s._AC_UY436_.%s", baseName, ext),
+						})
+					}
+				}
+			}
+			return images, imageDetails
+		}
 	}
 
+	// 3. 正则强行提取备选
 	imgURLRegex := regexp.MustCompile(`(https://m\.media-amazon\.com/images/I/.*?)":\s?\[(\d+),\s?\d+\]`)
 	imgMatches := imgURLRegex.FindAllStringSubmatch(content, -1)
 
@@ -131,17 +224,29 @@ func (e *AmazonExtractor) getImgSrc(content string) []string {
 		}
 	}
 
-	// 去重
 	uniqueSrcs := make(map[string]bool)
 	var result []string
 	for _, src := range srcs {
 		if !uniqueSrcs[src] {
 			uniqueSrcs[src] = true
 			result = append(result, src)
+
+			// 兜底尺寸生成
+			parts := strings.Split(src, ".")
+			if len(parts) >= 4 {
+				baseName := strings.Join(parts[:len(parts)-1], ".")
+				ext := parts[len(parts)-1]
+				imageDetails = append(imageDetails, AmazonImage{
+					Original: src,
+					Small:    fmt.Sprintf("%s._AC_UY218_.%s", baseName, ext),
+					Medium:   fmt.Sprintf("%s._AC_UY327_.%s", baseName, ext),
+					Large:    fmt.Sprintf("%s._AC_UY436_.%s", baseName, ext),
+				})
+			}
 		}
 	}
 
-	return result
+	return result, imageDetails
 }
 
 // getVideos 获取产品视频URL列表 (私有方法)
@@ -241,7 +346,7 @@ func (e *AmazonExtractor) GetProductDetail(url, text string) ProductResult {
 	}
 
 	productDetail := e.getProductTextDetail(doc)
-	srcs := e.getImgSrc(text)
+	srcs, imageDetails := e.getImgSrc(text)
 
 	aplus := doc.Find("#aplus")
 	var aplusHTML string
@@ -252,13 +357,16 @@ func (e *AmazonExtractor) GetProductDetail(url, text string) ProductResult {
 	videos := e.getVideos(text, doc, aplusHTML)
 
 	return ProductResult{
-		LinkURL:  url,
-		Title:    productDetail.Title,
-		Desc:     productDetail.ByDesc,
-		Language: productDetail.Language,
-		Images:   srcs,
-		Videos:   videos,
-		Price:    productDetail.ProductPrice,
-		Discount: productDetail.ProductDiscount,
+		LinkURL:       url,
+		Title:         productDetail.Title,
+		Desc:          productDetail.ByDesc,
+		Language:      productDetail.Language,
+		Images:        srcs,
+		Videos:        videos,
+		Price:         productDetail.ProductPrice,
+		Discount:      productDetail.ProductDiscount,
+		AboutThisItem: productDetail.AboutThisItem,
+		ProductID:     productDetail.ProductID,
+		ImageDetails:  imageDetails,
 	}
 }

@@ -17,7 +17,8 @@ func TestAmazonProductDetail(t *testing.T) {
 	spider := NewAmazonSpider()
 
 	// 设置测试URL (Sony WH-1000XM5 耳机)
-	testURL := "https://www.amazon.com/Sony-WH-1000XM5-Canceling-Headphones-Hands-Free/dp/B09XS7JWHH"
+	//testURL := "https://www.amazon.com/Sony-WH-1000XM5-Canceling-Headphones-Hands-Free/dp/B09XS7JWHH"
+	testURL := "https://www.amazon.com/dp/B0G2LT19TC/ref=mweb_up_am_fl_st_na_un_up_sm_web?th=1&psc=1"
 
 	// 设置超时上下文
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
