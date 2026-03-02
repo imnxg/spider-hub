@@ -1,4 +1,4 @@
-module github.com/xieburoucoco/spider-hub
+module github.com/imnxg/spider-hub
 
 go 1.24
 
